@@ -1,0 +1,1016 @@
+---
+title: "**Siemens - Data Challenge**"
+author: Alexander Vosseler
+date: "13.09.2019"
+output: 
+  html_notebook:
+    theme: united
+    toc: yes
+    number_sections: true
+---
+
+```{r setup, echo = FALSE, message = FALSE}
+rm(list=ls()) ; options(warn = -1)     # suppress warnings
+#library(captioner)    # for nice captions and references in fig and tables
+library(knitr)
+library(pander)
+library(dplyr)
+library(lubridate)
+library(prophet)
+library(forecast)
+library(forecastHybrid)
+#library(ForecastCombinations)
+#library(ForecastComb)
+library(ggplot2)
+#library(urca)
+#library(dlm)
+library(skimr)
+library(xts)
+library(zoo)
+```
+
+<br>
+
+**Data and statistical target:** 
+
+- Data set comprises monthly time series of 18 different products, sold in 13 different countries. 
+
+- Observation period is 2012-10 to 2018-09
+
+- Task: 6-step ahead prediction for each time series, i.e. for 2018-10 to 2019-03
+
+<br>
+
+**Modeling strategy:**
+
+<br>
+
+**1. Descriptive (univar./multivar.) analysis**
+      
+- Trends, Seasonal components, Business cycles, Structural breaks, missing values, potential measurement errors
+      
+- Check for nonstationarity, test for normality etc.
+
+
+```{r echo=F}
+data = readRDS("../data/raw_data.rds")
+ts_all = readRDS("../data/data_mts_78.rds")
+mts_data = readRDS("../data/data_mat_78.rds")
+#ts_all = readRDS("../data/data_mts_42.rds")
+#mts_data = readRDS("../data/data_mat_42.rds")
+#data = read.csv("../data/DataChallenge_2019-07.csv")
+data$Date = as.Date(data$Date) 
+```
+<br>
+
+Data quality issues?
+```{r}
+data %>% filter(Demand < 0)
+```
+<br>
+
+$\rightarrow$ replace observations with missing value (these will be imputed later):
+```{r}
+data_cleaned = data %>% mutate(Demand_cleaned = factor(ifelse(Demand < 0 , NA, Demand)))
+```
+<br>
+
+Block of $T = 78$ and $T = 42$ time series
+
+```{r}
+dgr = data_cleaned %>% group_by(Country, Product) %>% 
+               summarise(n = n(), start_date = min(Date), end = max(Date)) %>% 
+               arrange(Country, Product) ;
+dgr
+```
+
+<br>
+
+**Univariate analysis:**
+
+*Example 1:*
+
+```{r echo=F}
+
+n.ahead = 6
+TT = ncol(mts_data)
+
+i = 2
+y = ts(mts_data[i,], start = start(ts_all), end = end(ts_all), frequency = frequency(ts_all))
+y_obs = subset(y, start = 1, end = TT-n.ahead)   # observed data
+
+par(mfrow=c(2,2))
+plot.ts(y_obs, main= paste("Series ", colnames(ts_all)[i]), col = "black", lty = 1, ylab="demand") ;
+points(y_obs, col="red")
+hist(y_obs,nclass=30, main="", col="grey", xlab="demand")
+acf(as.numeric(y_obs), lag.max = 50, main="ACF")
+pacf(as.numeric(y_obs), lag.max = 50, main = "PACF")
+```
+
+
+<br>
+
+Observe STL decomposition to extract structural components:
+
+```{r}
+  y_obs %>%
+    stl(s.window="periodic", robust=TRUE) %>%
+    autoplot(main=paste("Series ", colnames(ts_all)[i]))
+```
+
+<br>
+
+Example 2:
+
+```{r echo=FALSE}
+i = 100
+y = ts(mts_data[i,], start = start(ts_all), end = end(ts_all), frequency = frequency(ts_all))
+y_obs = subset(y, start = 1, end = TT-n.ahead)   # observed data
+
+par(mfrow=c(2,2))
+plot.ts(y_obs, main= paste("Series ", colnames(ts_all)[i]), col = "black", lty = 1, ylab="demand") ;
+points(y_obs, col="red")
+hist(y_obs,nclass=30, main="", col="grey", xlab="demand")
+acf(as.numeric(y_obs), lag.max = 50, main="ACF")
+pacf(as.numeric(y_obs), lag.max = 50, main = "PACF")
+```
+
+```{r}
+  y_obs %>%
+    stl(s.window="periodic", robust=TRUE) %>%
+    autoplot(main=paste("Series ", colnames(ts_all)[i]))
+```
+
+<br>
+
+**So far:**
+
+- Univariate time series exhibit trend, periodic components 
+
+- In addition: 
+
+    - various tests for normality show that trajectories (DGP) are not approx. normally distr.   
+    - Some evidence for (non-) seasonal forms of nonstationarity (unit root tests not reported).
+    
+    - Relevant for data preprocessing
+
+<br>
+
+**2. Data preprocessing (incl. feature engineering) + model selection**
+
+General questions:
+
+- Apply trend/seasonal adjustment and apply model or explicitly incorporate seasonality
+
+- Transform data to approx. normality (Box-Cox etc.) or use models for count data (non-negative support).
+
+<br>
+
+**Candidate models:**
+
+- Univariate time series approach 
+
+    - Used candidate models:
+    
+        - Facebook's Prophet (GAM)
+        - State space models: (STL-) ETS, TBATS (with ARMA erros), Bayesian STS
+        - FNN: Single hidden layer with (non) seasonal lagged endogenous input variables
+        - Random forest with (non) seasonal lagged endogenous input variables
+        - (S)AR(F)IMA models
+        - Model Ensembles: Different combination strategies using subsets of candidate models 
+        - Benchmarks: RwD, Seasonal RwD, Linear time series regression with trend + season
+
+      
+<br>
+
+- Multivariate time series approach (to utilize potential crosssectional dependencies)
+
+    - Used candidates: BVAR (after seasonal adjustment)
+
+<br>
+
+- (Dynamic) Panel data approach (to utilize hierarchical country - product structure of the data) 
+
+<br>
+
+**Model selection**
+
+- Finally used set of candidates: 
+
+    1.) Prophet
+    
+    2.) ETS
+    
+    3.) FNN
+    
+    4.) Model ensemble of 1.), 3.) and an Exponential smoothing state space ('Theta model') 
+    
+    5.) Benchmark: RwD
+
+
+
+<br>
+
+```{r echo=F}
+#source("C:\\Users\\Alexander\\Documents\\Arbeit\\Siemens\\ts_stuff\\candidate_models.R")
+#source("C:\\Users\\Alexander\\Documents\\Arbeit\\Siemens\\ts_stuff\\BayesOpt_utils.R")
+#source("C:\\Users\\Alexander\\Documents\\Arbeit\\Siemens\\ts_stuff\\hyper_opt2.R")
+#source("C:\\Users\\Alexander\\Documents\\Arbeit\\Siemens\\ts_stuff\\model_selection.R")
+```
+
+
+```{r}
+###################################################
+## Wrapper functions for training and prediction: 
+###################################################
+
+# Prophet:
+run_prophet = function(y.window, n.ahead,...){
+  print("Fitting PROPHET")
+  df = data.frame(ds = as.yearmon(time(y.window)), y = y.window)
+  m = prophet(df, ...)
+  future = make_future_dataframe(m, periods = n.ahead, freq = 'month')
+  forecast = predict(m, future)
+  return(list(fitted_model = m, data_new = future, forecast = forecast))
+}
+
+
+# FNN:
+run_fnn = function(y.window, n.ahead,...){
+  print("Fitting NNETAR")
+  #xreg = fourier(y.window, K = 2)    # fourier pairs
+  #xreg_new = fourier(y.window, K = 2, h = n.ahead)    # fourier pairs future
+  fit_nnetar = y.window %>% nnetar(...) 
+  fore_nnetar = fit_nnetar %>% forecast(h = n.ahead) 
+  return(list(fitted_model = fit_nnetar, data_new = NULL, forecast = fore_nnetar))
+}
+
+# Ensemble:
+run_ensem = function(y.window, n.ahead,...){
+    print("Fitting ENSEMBLE")
+    fit_ensem = y.window %>% hybridModel(...)
+    fore_ensem = fit_ensem %>% forecast(h = n.ahead) 
+    return(list(fitted_model = fit_ensem, data_new = NULL, forecast = fore_ensem))
+}
+
+  
+# ARFIMA:
+run_arfima = function(y.window, n.ahead,...){
+  print("Fitting ARFIMA")
+  #xreg = fourier(y.window, K = 2)    # fourier pairs
+  #xreg_new = fourier(y.window, K = 2, h = n.ahead)    # fourier pairs future
+  fit_arfima = y.window %>% arfima(...) 
+  fore_arfima = fit_arfima %>% forecast(h = n.ahead) 
+  return(list(fitted_model = fit_arfima, data_new = NULL, forecast = fore_arfima))
+}
+
+
+# ETS
+run_ets = function(y.window, n.ahead,...){
+  print("Fitting ETS")
+  fit_ets = y.window %>% ets(...) 
+  fore_ets = fit_ets %>% forecast(h = n.ahead) #%>% autoplot()
+  return(list(fitted_model = fit_ets, data_new = NULL, forecast = fore_ets))
+}
+
+
+# STLM-ETS
+run_stlm_ets = function(y.window, n.ahead,...){
+  print("Fitting STLM-ETS")
+  fit_stlm = y.window %>% stlm(...) 
+  fore_stlm = fit_stlm %>% forecast(h = n.ahead) #%>% autoplot()
+  return(list(fitted_model = fit_stlm, data_new = NULL, forecast = fore_stlm))
+}
+
+
+# TBATS : Exponential smoothing state space model 
+# with Box-Cox transformation, ARMA errors, 
+# Trend and Seasonal componentsforecasts
+run_tbats = function(y.window, n.ahead,...){
+  print("Fitting TBATS")
+  fit_tbats = y.window %>% tbats(...) 
+  fore_tbats = fit_tbats %>% forecast(h = n.ahead)
+  return(list(fitted_model = fit_tbats, data_new = NULL, forecast = fore_tbats))
+}
+
+
+
+# RwD:
+run_rwd = function(y.window, n.ahead,...){
+  print("Fitting RW")
+  fit_rwd = y.window %>% rwf(drift = T) 
+  fore_rwd = fit_rwd %>% forecast(h = n.ahead) 
+  return(list(fitted_model = fit_rwd, data_new = NULL, forecast = fore_rwd))
+}
+```
+
+```{r}
+
+model_selection = function(y_obs, p_oob = 0.85, n.ahead = 6)
+{
+  (T_obs = length(y_obs))
+  (R = floor(T_obs * p_oob))                       #the higher n, the more accurate the forecasts! 
+  
+  # Rolling window approach to compute out-of-bag error:
+  #-------------------------------------------------------------------
+  j = 0 ; all_metrics = ets.RMSE = arima.RMSE = arfima.RMSE = tbats.RMSE = NULL;
+  stlm.RMSE = fnn.RMSE = rw.RMSE = pro.RMSE = ens.RMSE = NULL
+  
+  while(j<(T_obs-n.ahead-R)) {
+    
+    train_index = 1:(R+j)
+    valid_index = (R+j+1):(R+j+n.ahead) 
+    (y.window = ts(y_obs[train_index], fre=frequency(y_obs),start=start(y_obs)))       #used subsample
+    (y.true = y_obs[valid_index])                             #actual values for comparison 
+    
+    if(any(is.na(y.true))){
+      warning('NAs in y.true')
+    }
+    
+    # Impute missing values and smooth outliers:
+    #--------------------------------------------
+    #(y.window = tsclean(y.window))
+    (y.window = na.interp(y.window))
+    
+    cat("\nTest error run nr.",j+1," (out of ",T_obs-n.ahead-R,") [Training size R: ",length(y.window),"]\n------------------------------------------------------------------\n",sep=""); 
+    cat("\nTraining batch (index) ", min(train_index), max(train_index), "\n")
+    cat("Validation batch (index) ", min(valid_index), max(valid_index),"\n\n")
+    
+    # Exponential smoothing state space model:
+    #-------------------------------------------
+    fore_ets = run_ets(y.window, n.ahead, nmse = n.ahead)
+    (yhat_ets = as.numeric(fore_ets$forecast$mean))
+    
+    bias_ets = yhat_ets - y.true
+    (ets.RMSE = rbind(ets.RMSE, bias_ets^2)); 
+    
+    # Automatic ARIMA forecasts:
+    #-----------------------------
+    # print("Fitting ARIMA")
+    # fore_arima = y.window %>% auto.arima(lambda = "auto", stationary = T) %>% 
+    #   forecast(h = n.ahead) 
+    # (yhat_arima = fore_arima$mean)
+    
+    # Automatic ARFIMA forecasts:
+    #-----------------------------
+    #print("Fitting ARFIMA")
+    #fore_arfima = y.window %>% arfima() %>% forecast(h = n.ahead) #%>% autoplot()
+    #(yhat_arfima = fore_arfima$mean)
+    #tsdisplay(residuals(fit))
+    
+    
+    # tryCatch({
+    #   fore_arfima = run_arfima(y.window, n.ahead, estim = c("ls"))
+    #   (yhat_arfima = as.numeric(fore_arfima$forecast$mean))
+    #   
+    #   bias_arfima = yhat_arfima - y.true
+    #   (arfima.RMSE = rbind(arfima.RMSE, bias_arfima^2)); 
+    #   
+    # }, warning = function(w) {
+    #   print(w)
+    # }, error = function(e) {
+    #   print(e)}
+    # )
+    
+    # Forecasting with STL
+    #------------------------
+    # stlm = run_stlm_ets(y.window, n.ahead, modelfunction=ar, allow.multiplicative.trend = T)
+    # (yhat_stlm  = as.numeric(stlm$forecast$mean))
+    # 
+    # bias_stlm = yhat_stlm - y.true
+    # (stlm.RMSE = rbind(stlm.RMSE, bias_stlm^2));
+
+    #print("Fitting STLF")
+    #fore_stlf = y.window %>% stlf(lambda=0) %>% forecast(h = n.ahead) #%>% autoplot()
+    #(yhat_stlf = fore_stlf$mean)
+    
+    #print("Fitting STL")
+    #fore_stl = y.window %>% stl(s.window='periodic') %>% forecast(h = n.ahead) #%>% autoplot()
+    #(yhat_stl = fore_stl$mean)
+    
+    # TBATS : Exponential smoothing state space model 
+    # with Box-Cox transformation, ARMA errors, 
+    # Trend and Seasonal componentsforecasts
+    #-----------------------------------------------------
+    #Tbats = run_tbats(y.window, n.ahead, seasonal.periods = frequency(y.window))
+    #(yhat_tbats = as.numeric(Tbats$forecast$mean))
+
+    #bias_tbats = yhat_tbats - y.true
+    #(tbats.RMSE = rbind(tbats.RMSE, bias_tbats^2));
+    
+    # Feed-forward neural networks with a single hidden layer and lagged inputs
+    #----------------------------------------------------------------------------
+    fnn = run_fnn(y.window, n.ahead)
+    (yhat_nnetar = as.numeric(fnn$forecast$mean))
+    
+    bias_fnn = yhat_nnetar - y.true
+    (fnn.RMSE = rbind(fnn.RMSE, bias_fnn^2));
+    
+    # Linear time series model:
+    #---------------------------
+    #fit_lm <- tslm(y.window ~ trend + season)
+    #fore_lm = forecast(fit_lm, h = n.ahead)
+    #(yhat_lm = fore_lm$mean)
+    
+    # Bsts model
+    #----------------------------
+      # print("Fitting BSTS")
+      # ss <- AddLocalLinearTrend(list(), y.window)
+      # ss <- AddSeasonal(ss, y.window, nseasons = 12)
+      # bsts.model <- bsts(y.window, state.specification = ss, niter = 500, ping=0, seed=2016)
+      # burn <- SuggestBurn(0.1, bsts.model)    ### Get a suggested number of burn-ins
+      # p <- predict.bsts(bsts.model, horizon = n.ahead, burn = burn, quantiles = c(.025, .975))
+      # (fore_bsts = p$mean)
+      
+      # Naive RW
+      #----------------------------------------------------------------------------
+    tryCatch({
+      rwd = run_rwd(y.window, n.ahead)
+      (yhat_rwd = rwd$forecast$mean)  
+    }, warning = function(w) {
+      print(w)
+    }, error = function(e) {
+      print(e)
+    })
+    
+    bias_rw = yhat_rwd - y.true
+    (rw.RMSE = rbind(rw.RMSE, bias_rw^2)); 
+    
+    # Naive SRW
+    #----------------------------------------------------------------------------
+    #print("Fitting SRW")
+    #fore_srw = y.window %>% snaive() %>% forecast(h = n.ahead) 
+    #(yhat_srw = fore_srw$mean)
+    
+    # Model ensemble 1:
+    #------------------
+    ensem = run_ensem(y.window, n.ahead,models = "efn", weights="equal", errorMethod = "RMSE")
+    (yhat_ensem = ensem$forecast$mean)
+    
+    bias_ens = yhat_ensem - y.true
+    (ens.RMSE = rbind(ens.RMSE, bias_ens^2)); 
+    
+    # Dynamic optimized theta model:
+    #---------------------------------
+    #print("Fitting Optimized Theta model")
+    #dynopt_theta <- dotm(y.window, h=n.ahead, s='additive')
+    #yhat_dtheta = dynopt_theta$mean
+    
+    # Prophet:
+    #--------------------
+    forec = run_prophet(y.window, n.ahead, 
+                        growth = 'linear',
+                        daily.seasonality = F,
+                        weekly.seasonality = F,
+                        n.changepoints = 5)
+    
+    fitt_train = forec$forecast[train_index, 'yhat']
+    yhat_pro = forec$forecast[valid_index, 'yhat']
+    
+    bias_pro = yhat_pro - y.true
+    (pro.RMSE = rbind(pro.RMSE, bias_pro^2)); 
+    
+
+    # Random Forest: only 1-step ahead
+    #-----------------------------------
+    # lags = 6
+    # train_set = data.frame(embed(y.window,d=lags+1)) ;#y0 = yy[,1] ; train_set = yy[,-1]
+    # colnames(train_set) = c("y",paste0("x",1:lags))
+    # if(j==0)
+    #    lrn = makeLearner("regr.randomForest")     # Random Forests 
+    # 
+    # tail(train_set)
+    # trainTask = makeRegrTask(data = train_set, target = "y")
+    # model = train(lrn, trainTask); 
+    # pred = predict(model, newdata = train_set)         # predict 'new' data, i.e. of the test set (or validation set)     
+    
+    #---------------
+    # Performances:
+    #---------------
+    metrics = c(ETS = accuracy(yhat_ets, y.true)["Test set",c("MAPE")],
+      #ARIMA = accuracy(fore_arima, y.true)["Test set",c("MAPE")],
+      #ARFIMA = accuracy(yhat_arfima, y.true)["Test set",c("MAPE")],
+      #`STLM-ETS` = accuracy(yhat_stlm, y.true)["Test set",c( "MAPE")],
+      
+      #`STL-ETS` = accuracy(fore_stl, y.true)["Test set",c("MAPE")],
+      #`STLF-ETS` = accuracy(fore_stlf, y.true)["Test set",c( "MAPE")],
+      NNAR = accuracy(yhat_nnetar, y.true)["Test set",c( "MAPE")],
+      #TBATS = accuracy(yhat_tbats, y.true)["Test set",c( "MAPE")],
+      RWD = accuracy(yhat_rwd, y.true)["Test set",c( "MAPE")],
+      #SRW_B2 = accuracy(fore_srw, y.true)["Test set",c( "MAPE")],
+      #Naive_Avg = accuracy(meanf(y.window, h = n.ahead), y.true)["Test set",c( "MAPE")],
+      #LM = accuracy(fore_lm, y.true)["Test set",c( "MAPE")],
+      #OptThe = accuracy(yhat_dtheta, y.true)["Test set",c( "MAPE")],
+      ENSEM = accuracy(yhat_ensem , y.true)["Test set",c( "MAPE")],
+      PROPHET = accuracy(yhat_pro, y.true)["Test set",c("MAPE")]
+      #BSTS = accuracy(fore_bsts, y.true)["Test set",c("MAPE")]
+    )
+    all_metrics = rbind(all_metrics, metrics)
+    j=j+1
+  }
+  
+  (mean_acc = colMeans(all_metrics)) 
+  
+  nstep_rmse = list(pro_RMSE = sqrt(colMeans(pro.RMSE)),
+                  ets.RMSE = sqrt(colMeans(ets.RMSE)),
+                  #tbats.RMSE = sqrt(colMeans(tbats.RMSE)),
+                  #stlm.RMSE = sqrt(colMeans(stlm.RMSE)),
+                  fnn.RMSE = sqrt(colMeans(fnn.RMSE)),
+                  rw.RMSE = sqrt(colMeans(rw.RMSE)),
+                  ens.RMSE = sqrt(colMeans(ens.RMSE))
+                  )
+  
+  print("Finished!")
+  cat("Best model:", names(mean_acc)[which.min(mean_acc)],"\n")
+  
+  rownames(all_metrics) = paste0("i=",1:nrow(all_metrics))
+  
+  return(list(all_metrics = all_metrics, 
+              nstep_rmse = nstep_rmse, 
+              mean_acc = mean_acc, 
+              winner = names(mean_acc)[which.min(mean_acc)]))
+}
+
+```
+
+
+
+```{r echo=FALSE}
+n.ahead = 6
+TT = ncol(mts_data)
+hyper_tune = F
+```
+
+<br>
+
+**Finally:**
+
+- loop over whole dataset
+
+- Use time series cross-validation to estimate OOB prediction error for each candidate
+
+- then, given best model retrain using whole trajectory 
+
+- optimize selected hyperparameters via BO using rolling window approach of above
+
+
+
+```{r}
+
+#################################################
+## Bayesian optimization with Scoring functions:
+#################################################
+
+hyper_optim = function(y_obs, p_oob = 0.8, n.ahead = 6, winner)
+{
+  #==============================================================
+  
+  (T_obs = length(y_obs))
+  (R = floor(T_obs * p_oob))        #the higher n, the more accurate the forecasts! 
+  
+  # FNN
+  #-------------------------------------------------------------------------------
+  bo_optim_fnn = function(p_nonsea, nof_nodes) {
+    
+    # Rolling window approach to compute out-of-bag error:
+    #--------------------------------------------------------------------------
+    j = 0 ; error = c()
+    while(j<(T_obs-n.ahead-R)) 
+    {
+      train_index = 1:(R+j)
+      valid_index = (R+j+1):(R+j+n.ahead) 
+      (y.window = ts(y_obs[train_index],fre=frequency(y_obs),start=start(y_obs)))       #used subsample
+      (y.true = y_obs[valid_index])                             #actual values for comparison 
+      
+      cat("\nTest error run nr.",j+1," (out of ",T_obs-n.ahead-R,") [Training size R: ",length(y.window),"]\n------------------------------------------------------------------\n",sep=""); 
+      
+      # FNN
+      #---------------------------------------------------------------------
+      #xreg = fourier(y.window, K = 2)    # fourier pairs
+      #xreg_new = fourier(y.window, K = 2, h = n.ahead)    # fourier pairs future
+      fore_nnetar = y.window %>% nnetar(p=p_nonsea, P=1, size=nof_nodes) %>% 
+        forecast(h = n.ahead) 
+
+      (yhat_nnetar = fore_nnetar$mean)
+      error_d = forecast::accuracy(yhat_nnetar, y.true)["Test set",c("MAPE")]
+      #------------------------------------------------------------------------
+      error = c(error, error_d)
+      j=j+1
+    }
+    return(list(Score = -mean(error)))
+  }
+  #----------------------------------------------------------------------------------
+  
+  
+  # Prophet - scoring/objective function to be maximized
+  #-------------------------------------------------------------------------------
+  bo_optim_prophet = function(changepoint_prior_scale, 
+                              seasonality_prior_scale, 
+                              n_changepoints) 
+  {
+    #assign('y_obs', y_obs, envir = global_env())
+
+    # Rolling window approach to compute out-of-bag error:
+    #--------------------------------------------------------------------------
+    j = 0 ; error = c()
+    while(j<=(T_obs-n.ahead-R)) 
+    {
+      train_index = 1:(R+j)
+      valid_index = (R+j+1):(R+j+n.ahead) 
+      (y.window = ts(y_obs[train_index],fre=frequency(y_obs),start=start(y_obs)))       #used subsample
+      (y.true = y_obs[valid_index])                             #actual values for comparison 
+      
+      cat("\nTest error run nr.",j," (out of ",T_obs-n.ahead-R,") [Training size R: ",length(y.window),"]\n------------------------------------------------------------------\n",sep=""); 
+      
+      # Prophet
+      #--------------------
+      df = data.frame(ds = as.yearmon(time(y.window)), y = y.window)
+      m = prophet(df, growth = 'linear',
+                  seasonality.prior.scale = seasonality_prior_scale,
+                  changepoint.prior.scale = changepoint_prior_scale,
+                  n.changepoints = n_changepoints,
+                  weekly.seasonality = F,
+                  daily.seasonality = F)
+      
+      future = make_future_dataframe(m, periods = n.ahead, freq = 'month')
+      forecast = predict(m, future)
+      fore_pro = forecast[valid_index, 'yhat']
+      error_d = forecast::accuracy(fore_pro, y.true)["Test set",c("MAPE")]
+      #---------------------------------------------------------------------
+      error = c(error, error_d)
+      j=j+1
+    }
+    return(list(Score = -mean(error)))
+  }
+  #----------------------------------------------------------------------------------
+  
+  #==============================================================
+  if(winner == 'PROPHET'){
+    
+    print("Optimize Prophet hyperparameter.")
+    
+    rand_search_grid =  data.frame(
+      changepoint_prior_scale = sort(runif(10, 0.01, 0.1)),
+      seasonality_prior_scale = c(sort(sample(c(runif(5, 0.01, 0.05), runif(5, 1, 10)), 5, replace = F)),
+                                  sort(sample(c(runif(5, 0.01, 0.05), runif(5, 1, 10)), 5, replace = F))),
+      n_changepoints          = sample(1:5, 5, replace = F),
+      Value                   = rep(0, 10))
+    
+    changepoint_bounds    = range(rand_search_grid$changepoint_prior_scale)
+    n_changepoint_bounds  = as.integer(range(rand_search_grid$n_changepoints))
+    seasonality_bounds    = range(rand_search_grid$seasonality_prior_scale)
+    
+    bayesian_search_bounds = list(changepoint_prior_scale = changepoint_bounds,
+                                  seasonality_prior_scale = seasonality_bounds,
+                                  n_changepoints = as.integer(n_changepoint_bounds))
+    
+    #tryCatch({
+    ba_search = BayesianOptimization(bo_optim_prophet,
+                                     bounds = bayesian_search_bounds,
+                                     init_grid_dt = rand_search_grid, 
+                                     init_points = 5, 
+                                     n_iter = 6,
+                                     acq = 'ucb', # 'ei'
+                                     kappa = 1, 
+                                     #kern = "Gaussian",  # "Matern52"
+                                     eps = 0,    # tuning parameter for aquisition function
+                                     verbose = TRUE)
+    
+    best_params_ba  = c(ba_search$Best_Par, Value = -1*ba_search$Best_Value)
+    
+    # }, warning = function(w) {
+    #   print(w)
+    # }, error = function(e) {
+    #   print(e)
+    # })
+    
+  }
+  #------------------------------------------------------------------------------------
+  if(winner == 'NNAR'){
+    
+    print("Optimize FNN hyperparameter.")
+    
+    grid_len = 10
+    rand_search_grid =  data.frame( 
+      nof_nodes          = sample(20:40, grid_len, replace = F),
+      p_nonsea          = sample(1:11, grid_len, replace = F),
+      Value                   = rep(0, grid_len)
+    ) 
+    
+    bayesian_search_bounds = list(nof_nodes = range(rand_search_grid$nof_nodes),
+                                  p_nonsea = range(rand_search_grid$p_nonsea))
+    
+    # Run:
+    ba_search = BayesianOptimization(bo_optim_fnn,
+                                     bounds = bayesian_search_bounds,
+                                     init_grid_dt = rand_search_grid, 
+                                     init_points = 5, 
+                                     n_iter = 6,
+                                     acq = 'ucb', # 'ei'
+                                     kappa = 1, 
+                                     #kern = "Gaussian",  # "Matern52"
+                                     eps = 0,
+                                     verbose = TRUE)
+    
+    best_params_ba  = c(ba_search$Best_Par, Value = -1*ba_search$Best_Value)
+    
+  }
+  return(best_params_ba)
+}
+
+```
+
+
+```{r}
+#------------------------- Loop over data set -------------------------------------------
+
+model_labels = NULL
+for(i in 1:1){ # nrow(mts_data)
+  
+  cat(paste0("\nSeries (Nr.",i," of ",nrow(mts_data),"): ", colnames(ts_all)[i]),"\n")
+  
+  (y = ts(mts_data[i,], start = start(ts_all), end = end(ts_all), frequency = frequency(ts_all)))
+  (y_obs = subset(y, start = 1, end = TT-n.ahead))   # observed data
+  
+  lambda <- BoxCox.lambda(y_obs)
+  (y_obs = BoxCox(y_obs, lambda = lambda))
+  
+  #(y_obs = log(1 + y_obs))
+  #(y_obs = tsclean(y_obs))
+  (y_obs = na.interp(y_obs))
+
+  #png("descr.png")  
+  par(mfrow=c(2,2))
+  plot.ts(y_obs, main= paste("Series ", colnames(ts_all)[i]), col = "black", lty = 1, ylab="demand") ;
+  points(y_obs, col="red")
+  hist(y_obs,nclass=30, main="", col="grey", xlab="demand")
+  acf(as.numeric(y_obs), lag.max = 50, main="ACF")
+  pacf(as.numeric(y_obs), lag.max = 50, main = "PACF")
+  #graphics.off()
+  
+  # Run:
+  #-------
+  out = model_selection(y_obs, p_oob = 0.89, n.ahead = n.ahead)
+
+  # Plot RMSE as a function of forecast horizon:
+  #------------------------------------------------
+  dat <- data.frame(pro = cumsum(out$nstep_rmse$pro_RMSE), 
+                    ets = cumsum(out$nstep_rmse$ets.RMSE),
+                    ens = cumsum(out$nstep_rmse$ens.RMSE),
+                    fnn = cumsum(out$nstep_rmse$fnn.RMSE),
+                    rwd = cumsum(out$nstep_rmse$rw.RMSE))
+  
+  #png("RMSEs.png")
+  matplot(dat, type = c("b"),pch=1,col = 1:ncol(dat), ylab="RMSE", xlab="forecast horizon", 
+          main = paste("Winner:", out$winner)) 
+  legend("topleft", legend = c('Prophet', 'ETS', 'ENSEM.','FNN', 'RwD'), col=1:ncol(dat), pch=1, bty="n")
+  #dev.off()
+  #-------------------------------------------------------------------------------------
+  
+  if(out$winner == 'PROPHET'){
+    if(hyper_tune){
+      
+        best_params_ba = hyper_optim(y_obs, p_oob=0.85, n.ahead=6, winner = out$winner) 
+        forec = run_prophet(y.window = y_obs, n.ahead = n.ahead, 
+                            growth = 'linear',       
+                            daily.seasonality = F,
+                            weekly.seasonality = F,
+                            seasonality.prior.scale = best_params_ba[['seasonality_prior_scale']], 
+                            changepoint.prior.scale = best_params_ba[['changepoint_prior_scale']],
+                            n.changepoints = best_params_ba[['n_changepoints']])
+     } else {
+      forec = run_prophet(y.window = y_obs, n.ahead = n.ahead, 
+                           growth = 'linear',
+                           daily.seasonality = F,
+                           weekly.seasonality = F,
+                           n.changepoints = 5) 
+     }
+    
+    yhat_pro = forec$forecast$yhat
+    (y_hat6 = yhat_pro[(length(yhat_pro)-n.ahead+1):length(yhat_pro)])
+   } 
+  #--------------------------------------------------------------------------
+  if(out$winner == 'ARFIMA'){
+
+    tryCatch({    # cannot cope with NAs!!!
+      fore_arfima = run_arfima(y.window = y_obs, n.ahead = n.ahead, estim = "ls")
+      (y_hat6 = fore_arfima$forecast$mean)
+    }, warning = function(w) {
+      print(w)
+    }, error = function(e) {
+      print(e)
+    })
+  }
+  #-----------------------------------------------------------------
+  if(out$winner == 'STLM-ETS'){
+      stlm = run_stlm_ets(y.window = y_obs, n.ahead, modelfunction=ar, 
+                          allow.multiplicative.trend = T)
+      (y_hat6  = as.numeric(stlm$forecast$mean))
+  }
+  #-----------------------------------------------------------------
+  if(out$winner == 'ETS'){
+      fore_ets = run_ets(y.window = y_obs, n.ahead)
+      (y_hat6 = as.numeric(fore_ets$forecast$mean))
+  }  
+  #-----------------------------------------------------------------
+  if(out$winner == 'ENSEM'){
+    
+    fore_ensem = run_ensem(y.window = y_obs, 
+                      n.ahead,models = "efn", 
+                      weights="equal", errorMethod = "RMSE")
+    (y_hat6 = as.numeric(fore_ensem$forecast$mean))
+  } 
+  #-----------------------------------------------------------------
+  if(out$winner == 'TBATS'){
+    
+    fore_tbats = run_tbats(y.window = y_obs, n.ahead, 
+                           seasonal.periods = frequency(y_obs))
+    (y_hat6 = as.numeric(fore_tbats$forecast$mean))
+  } 
+  #--------------------------------------------------------------
+  if(out$winner == 'RWD'){
+    
+    tryCatch({
+      rwd = run_rwd(y.window = y_obs, n.ahead = n.ahead)
+      (y_hat6 = rwd$forecast$mean)  
+    }, warning = function(w) {
+      print(w)
+    }, error = function(e) {
+      print(e)
+    }#, finally = {print("Out")}
+    )
+  }
+  #-----------------------------------------------------------------
+  if(out$winner == 'NNAR'){
+    
+    if(hyper_tune){
+        best_params_ba = hyper_optim(y_obs, p_oob = 0.85, n.ahead = 6, winner = out$winner) 
+        
+        fnn = run_fnn(y.window = y_obs, n.ahead = n.ahead, 
+                      p = best_params_ba[['p_nonsea']], size = best_params_ba[['nof_nodes']])
+    } else{
+      fnn = run_fnn(y.window = y_obs, n.ahead = n.ahead)
+    }
+    (y_hat6 = as.numeric(fnn$forecast$mean))
+  }
+  #--------------------------------------------------------------------
+
+  # Save series name and winner:
+  model_labels = rbind(model_labels, c(series = colnames(ts_all)[i], model = out$winner))
+
+  # Reverse Box-Cox transformation:
+  (yhat6_retransf = InvBoxCox(y_hat6, lambda = lambda))
+  
+  stopifnot(length(yhat6_retransf) == n.ahead)
+  #up95 = fore_ets$forecast$upper[,'95%']
+  #low95 = fore_ets$forecast$lower[,'95%']
+  
+  # Assign and retransform:
+  mts_data[i,(ncol(mts_data)-n.ahead+1):ncol(mts_data)] = yhat6_retransf
+  
+  par(mfrow=c(1,1), ask=F)
+  plot.ts(mts_data[i,], lty=2,main= paste("Series ", colnames(ts_all)[i]), ylab="demand")
+  lines(c(ncol(mts_data)-n.ahead+1):ncol(mts_data), yhat6_retransf, col="red")
+  #points(c(ncol(mts_data)-n.ahead+1):ncol(mts_data), yhat6_retransf, col="red")
+  abline(v = ncol(mts_data)-n.ahead+1, lty = 3, col="grey")
+  
+}; print("FINISHED!")
+
+
+```
+<br>
+
+
+E.g. for a single run:
+
+```{r echo=FALSE}
+
+i = 5
+cat(paste0("\nSeries (Nr.",i," of ",nrow(mts_data),"): ", colnames(ts_all)[i]),"\n")
+
+y = ts(mts_data[i,], start = start(ts_all), end = end(ts_all), frequency = frequency(ts_all))
+y_obs = subset(y, start = 1, end = TT-n.ahead)   # observed data
+
+lambda <- BoxCox.lambda(y_obs)
+y_obs = BoxCox(y_obs, lambda = lambda)
+
+#(y_obs = log(1 + y_obs))
+y_obs = na.interp(y_obs)
+
+out = model_selection(y_obs, p_oob = 0.85, n.ahead = 6) 
+```
+
+
+<br>
+
+Plot (cumulated) RMSE as a function of forecast horizon:
+```{r echo=FALSE}
+dat <- data.frame(pro = cumsum(out$nstep_rmse$pro_RMSE), 
+                  ets = cumsum(out$nstep_rmse$ets.RMSE),
+                  ens = cumsum(out$nstep_rmse$ens.RMSE),
+                  fnn = cumsum(out$nstep_rmse$fnn.RMSE),
+                  rwd = cumsum(out$nstep_rmse$rw.RMSE))
+
+matplot(dat, type = c("b"),pch=1,col = 1:ncol(dat), ylab="RMSE", xlab="forecast horizon", 
+        main = paste("Winner:", out$winner)) 
+legend("topleft", legend = c('Prophet', 'ETS', 'ENSEM.','FNN', 'RwD'), col=1:ncol(dat), pch=1, bty="n")
+```
+
+
+
+<br>
+
+Optimize selected hyperparameters (here scale parameter of Normal and Laplace prior), e.g. Prophet model:
+
+```{r}
+best_params_ba = hyper_optim(y_obs, p_oob=0.85, n.ahead=6, winner = 'PROPHET') 
+```
+
+
+```{r echo=FALSE}
+forec = run_prophet(y.window = y_obs, n.ahead = n.ahead, 
+                    growth = 'linear',       
+                    daily.seasonality = F,
+                    weekly.seasonality = F,
+                    seasonality.prior.scale = best_params_ba[['seasonality_prior_scale']], 
+                    changepoint.prior.scale = best_params_ba[['changepoint_prior_scale']],
+                    n.changepoints = best_params_ba[['n_changepoints']])
+
+yhat_pro = forec$forecast$yhat
+y_hat6 = yhat_pro[(length(yhat_pro)-n.ahead+1):length(yhat_pro)]
+
+```
+
+
+
+```{r echo=FALSE}
+# Reverse Box-Cox transformation:
+yhat6_retransf = InvBoxCox(y_hat6, lambda = lambda)
+#up95 = InvBoxCox(forec$forecast$upper[,'95%'], lambda = lambda)
+#low95 = InvBoxCox(forec$forecast$lower[,'95%'], lambda = lambda)
+
+# Assign and retransform:
+mts_data[i,(ncol(mts_data)-n.ahead+1):ncol(mts_data)] = yhat6_retransf
+
+par(mfrow=c(1,1), ask=F)
+plot.ts(mts_data[i,], lty=2,main= paste("Series: ", colnames(ts_all)[i]), ylab="demand")
+lines(c(ncol(mts_data)-n.ahead+1):ncol(mts_data), yhat6_retransf, col="red")
+#points(c(ncol(mts_data)-n.ahead+1):ncol(mts_data), yhat6_retransf, col="red")
+abline(v = ncol(mts_data)-n.ahead+1, lty = 3, col="grey")
+legend("topleft", legend = c('Orig.', 'Forecast'), col=c('black', 'red'), bty="n", lty=c(2,1))
+
+```
+
+
+
+<br>
+
+**Model results** 
+
+```{r echo=FALSE}
+output42 = read.csv2("../data/output42.csv")
+output78 = read.csv2("../data/output78.csv")
+
+ts_all78 = readRDS("../data/data_mts_78.rds")
+#mts_data78 = readRDS("../data/data_mat_78.rds")
+ts_all42 = readRDS("../data/data_mts_42.rds")
+#mts_data42 = readRDS("../data/data_mat_42.rds")
+
+colnames(output78)= c('Country/Product','model',format(as.yearmon(time(ts_all78)), "%Y-%m"))
+colnames(output42)= c('Country/Product','model',format(as.yearmon(time(ts_all42)), "%Y-%m"))
+```
+
+
+<br>
+
+Raw time series, used forecasting model and 6-step ahead forecasts ($T=78$ block):
+
+```{r}
+output78
+```
+
+<br>
+
+Raw time series, used forecasting model and 6-step ahead forecasts ($T=42$ block):
+
+```{r}
+output42
+```
+
+<br>
+
+**Next steps:**
+
+- In a Box-Jenkins modeling paradigm: model (residual) diagnosis $\rightarrow$ respecify/retrain?
+
+- Business-wise: 
+
+    - Model serving: 1.) build REST API (e.g. using Plumber) to trigger model, 2.) package model, 3.) deploy whole package in Docker container
+
+    - set up backtesting system (e.g. via Shiny) to get alarm in case the model would decrease from estimated OOB error (over some time period, $s=6,12...$). 
+
+    - Get feedback from users $\rightarrow$ model refinement
+
+<br>
+
+
